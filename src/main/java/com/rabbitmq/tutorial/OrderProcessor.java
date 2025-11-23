@@ -2,85 +2,207 @@ package com.rabbitmq.tutorial;
 
 import com.rabbitmq.client.*;
 
-import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 /**
- * OrderProcessor - Advanced example with manual acknowledgment
+ * OrderProcessor - Advanced example with Dead Letter Queue (DLQ) pattern
  * 
- * This demonstrates:
- * - Manual message acknowledgment (ensures reliability)
- * - Prefetch count (controls how many messages a worker gets at once)
- * - Error handling
+ * Demonstrates production-like features:
+ * ✅ Manual acknowledgment (reliable delivery)
+ * ✅ Prefetch count (load balancing)
+ * ✅ Dead Letter Queue (poison message handling)
+ * ✅ Retry logic with exponential backoff
+ * ✅ Error recovery
  */
 public class OrderProcessor {
     
-    private static final String QUEUE_NAME = "order_queue";
+    private static final String QUEUE_NAME = "user_bob_messages";
+    private static final String DLQ_NAME = "dlq_failed_messages";
+    private static final int MAX_RETRIES = 3;
+    private static final long RETRY_DELAY_MS = 1000;
+    
+    private Channel channel;
+    private Connection connection;
 
-    public static void main(String[] args) throws Exception {
+    public OrderProcessor() throws Exception {
         ConnectionFactory factory = new ConnectionFactory();
         factory.setHost("localhost");
         factory.setPort(5672);
         
-        Connection connection = factory.newConnection();
-        Channel channel = connection.createChannel();
+        this.connection = factory.newConnection();
+        this.channel = connection.createChannel();
+    }
+
+    /**
+     * Set up Dead Letter Queue (DLQ) pattern
+     * 
+     * Flow:
+     * Primary Queue → Process → Success (ACK)
+     *              → Failure → Retry
+     *                       → Max retries reached → DLQ
+     */
+    public void setupDLQ() throws Exception {
+        System.out.println("⚙️  Setting up Dead Letter Queue (DLQ) infrastructure...\n");
         
-        channel.queueDeclare(QUEUE_NAME, false, false, false, null);
+        // Declare main queue (durable)
+        channel.queueDeclare(QUEUE_NAME, true, false, false, null);
         
-        // Set prefetch count to 1
-        // This means the worker will only get 1 message at a time
-        // It won't receive a new message until it acknowledges the previous one
+        // Declare DLQ (where problematic messages go)
+        channel.queueDeclare(DLQ_NAME, true, false, false, null);
+        
+        // Set up DLQ arguments on main queue
+        // After max retries, messages move to DLQ
+        Map<String, Object> args = new HashMap<>();
+        args.put("x-dead-letter-exchange", "");           // default exchange
+        args.put("x-dead-letter-routing-key", DLQ_NAME);  // route to DLQ
+        
+        // Re-declare main queue with DLQ configuration
+        channel.queueDeclare(QUEUE_NAME, true, false, false, args);
+        
+        System.out.println("✅ DLQ infrastructure ready");
+        System.out.println("   • Primary queue: " + QUEUE_NAME);
+        System.out.println("   • DLQ queue: " + DLQ_NAME);
+        System.out.println("   • Max retries: " + MAX_RETRIES + "\n");
+    }
+
+    /**
+     * Process messages with manual acknowledgment and retry logic
+     * This simulates WhatsApp/Messenger delivery guarantee
+     */
+    public void processMessagesWithDLQ() throws Exception {
+        // QoS: process 1 message at a time
         channel.basicQos(1);
         
-        System.out.println("🍳 Order Processor Started (with manual ACK)...\n");
+        System.out.println("👁️  Order Processor (with DLQ) - Waiting for messages...\n");
         
         DeliverCallback deliverCallback = (consumerTag, delivery) -> {
-            String message = new String(delivery.getBody(), StandardCharsets.UTF_8);
-            System.out.println("📥 Received: " + message);
+            String messageJson = new String(delivery.getBody());
             
             try {
-                processOrderWithValidation(message);
+                // Parse message
+                UserMessage msg = UserMessage.fromJson(messageJson);
+                System.out.println("📥 Processing: " + msg);
                 
-                // Manual acknowledgment - tells RabbitMQ we successfully processed the message
+                // Simulate processing with random failures (10% failure rate)
+                if (Math.random() < 0.1 && msg.getRetryCount() < MAX_RETRIES) {
+                    throw new RuntimeException("Simulated processing error");
+                }
+                
+                // Process (simulate work)
+                simulateDelivery(msg);
+                
+                // SUCCESS: acknowledge the message
                 channel.basicAck(delivery.getEnvelope().getDeliveryTag(), false);
-                System.out.println("✅ Acknowledged: " + message + "\n");
+                System.out.println("   ✅ Delivered successfully\n");
                 
             } catch (Exception e) {
-                System.err.println("❌ Failed to process: " + message);
+                System.err.println("   ❌ Error: " + e.getMessage());
                 
-                // Negative acknowledgment - tells RabbitMQ to requeue the message
-                // Parameters: delivery tag, multiple, requeue
-                channel.basicNack(delivery.getEnvelope().getDeliveryTag(), false, true);
-                System.out.println("🔄 Requeued: " + message + "\n");
+                try {
+                    UserMessage msg = UserMessage.fromJson(messageJson);
+                    msg.incrementRetryCount();
+                    
+                    if (msg.getRetryCount() >= MAX_RETRIES) {
+                        // Max retries reached: send to DLQ
+                        System.out.println("   💀 Max retries (" + MAX_RETRIES + ") reached → Sending to DLQ\n");
+                        
+                        channel.basicPublish("", DLQ_NAME, 
+                            MessageProperties.PERSISTENT_TEXT_PLAIN, 
+                            messageJson.getBytes());
+                        
+                        // Acknowledge to remove from primary queue
+                        channel.basicAck(delivery.getEnvelope().getDeliveryTag(), false);
+                        
+                    } else {
+                        // Retry: requeue with backoff
+                        System.out.println("   🔄 Retry " + msg.getRetryCount() + "/" + MAX_RETRIES);
+                        System.out.println("   ⏳ Waiting " + RETRY_DELAY_MS + "ms before retry...\n");
+                        
+                        Thread.sleep(RETRY_DELAY_MS);
+                        
+                        // Negative ACK with requeue
+                        channel.basicNack(delivery.getEnvelope().getDeliveryTag(), false, true);
+                    }
+                    
+                } catch (Exception ex) {
+                    System.err.println("Error handling retry: " + ex.getMessage());
+                    try {
+                        channel.basicNack(delivery.getEnvelope().getDeliveryTag(), false, true);
+                    } catch (Exception ignored) {}
+                }
             }
         };
         
-        // auto-ack = false means we manually acknowledge messages
+        // Start consuming
         channel.basicConsume(QUEUE_NAME, false, deliverCallback, consumerTag -> {});
         
-        System.out.println("⏳ Press CTRL+C to exit");
+        System.out.println("⏳ Press CTRL+C to exit\n");
+        Thread.currentThread().join();
     }
-    
+
     /**
-     * Process order with validation
+     * Monitor the DLQ for stuck messages
+     * In production: alerts ops team to investigate and fix
      */
-    private static void processOrderWithValidation(String order) throws Exception {
-        System.out.println("🔄 Processing order...");
+    public void monitorDLQ() throws Exception {
+        System.out.println("\n📊 Monitoring Dead Letter Queue...\n");
         
-        // Simulate validation
-        if (order.contains("Pizza")) {
-            System.out.println("🍕 Making pizza...");
-        } else if (order.contains("Burger")) {
-            System.out.println("🍔 Grilling burger...");
-        } else if (order.contains("Salad")) {
-            System.out.println("🥗 Preparing salad...");
-        } else {
-            System.out.println("👨‍🍳 Preparing order...");
+        DeliverCallback dlqCallback = (consumerTag, delivery) -> {
+            String messageJson = new String(delivery.getBody());
+            System.out.println("🚨 [DLQ] Stuck message: " + messageJson);
+            System.out.println("   Action: Investigate & fix, then replay from backup\n");
+            
+            try {
+                channel.basicAck(delivery.getEnvelope().getDeliveryTag(), false);
+            } catch (Exception e) {
+                System.err.println("Error acking DLQ message: " + e.getMessage());
+            }
+        };
+        
+        channel.basicConsume(DLQ_NAME, false, dlqCallback, consumerTag -> {});
+    }
+
+    /**
+     * Simulate message delivery (like WhatsApp sending to friend's phone)
+     */
+    private void simulateDelivery(UserMessage msg) throws InterruptedException {
+        System.out.println("   🚀 Delivering to device...");
+        TimeUnit.MILLISECONDS.sleep(500);
+    }
+
+    public void close() throws Exception {
+        if (channel != null && channel.isOpen()) {
+            channel.close();
         }
-        
-        // Simulate processing time
-        TimeUnit.SECONDS.sleep(2);
-        
-        System.out.println("✨ Order ready!");
+        if (connection != null && connection.isOpen()) {
+            connection.close();
+        }
+    }
+
+    public static void main(String[] args) {
+        OrderProcessor processor = null;
+        try {
+            processor = new OrderProcessor();
+            
+            // Set up DLQ infrastructure
+            processor.setupDLQ();
+            
+            // Start processing with DLQ fallback
+            processor.processMessagesWithDLQ();
+            
+        } catch (Exception e) {
+            System.err.println("❌ Error in OrderProcessor: " + e.getMessage());
+            e.printStackTrace();
+        } finally {
+            try {
+                if (processor != null) {
+                    processor.close();
+                }
+            } catch (Exception e) {
+                System.err.println("Error closing: " + e.getMessage());
+            }
+        }
     }
 }

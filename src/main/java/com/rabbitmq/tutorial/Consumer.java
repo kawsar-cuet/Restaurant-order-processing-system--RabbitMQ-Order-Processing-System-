@@ -5,60 +5,161 @@ import com.rabbitmq.client.Connection;
 import com.rabbitmq.client.ConnectionFactory;
 import com.rabbitmq.client.DeliverCallback;
 
-import java.nio.charset.StandardCharsets;
-
 /**
- * Consumer - Receives and processes messages from RabbitMQ queue
+ * Consumer - Enhanced version for multi-user messaging
  * 
- * Think of this as the kitchen that receives and processes
- * customer orders from the ordering system.
+ * Improvements:
+ * ✅ Consumes per-user queues (each user has own inbox)
+ * ✅ Structured message handling (UserMessage objects)
+ * ✅ Auto-ack (simple) vs manual-ack (reliable)
+ * ✅ Proper message deserialization
+ * ✅ Simulates real-time message delivery
  */
 public class Consumer {
     
-    private static final String QUEUE_NAME = "order_queue";
+    private String userId;  // Which user's queue to consume
+    private Connection connection;
+    private Channel channel;
 
-    public static void main(String[] args) throws Exception {
-        // Connection factory - configuration for connecting to RabbitMQ
+    public Consumer(String userId) throws Exception {
+        this.userId = userId;
+        
         ConnectionFactory factory = new ConnectionFactory();
         factory.setHost("localhost");
         factory.setPort(5672);
         
-        Connection connection = factory.newConnection();
-        Channel channel = connection.createChannel();
+        this.connection = factory.newConnection();
+        this.channel = connection.createChannel();
+    }
+
+    /**
+     * Consume messages for this user (auto-acknowledge)
+     * Simple approach: messages auto-deleted after delivery
+     * Used when you don't need strict reliability (or want fast throughput)
+     */
+    public void consumeMessagesAutoAck() throws Exception {
+        String queueName = "user_" + userId + "_messages";
         
-        // Declare the same queue (ensures it exists)
-        channel.queueDeclare(QUEUE_NAME, false, false, false, null);
+        // Declare queue (durable, so it survives restart)
+        channel.queueDeclare(queueName, true, false, false, null);
         
-        System.out.println("🍳 Consumer Started - Waiting for orders...\n");
+        System.out.println("🔔 Consumer for user '" + userId + "' - Waiting for messages...\n");
         
-        // Callback function that processes each message
+        // Callback: executed when message arrives
         DeliverCallback deliverCallback = (consumerTag, delivery) -> {
-            String message = new String(delivery.getBody(), StandardCharsets.UTF_8);
-            System.out.println("📥 Received: " + message);
+            String messageJson = new String(delivery.getBody());
             
             try {
-                // Simulate processing time (cooking the food)
-                processOrder(message);
-                System.out.println("✅ Processed: " + message + "\n");
-            } catch (InterruptedException e) {
-                System.err.println("❌ Error processing: " + message);
-                Thread.currentThread().interrupt();
+                // Deserialize and display
+                UserMessage msg = UserMessage.fromJson(messageJson);
+                System.out.println("📥 [" + userId + "] Received: " + msg);
+                
+                // Simulate reading the message
+                Thread.sleep(1000);
+                System.out.println("   ✓ Message read\n");
+                
+            } catch (Exception e) {
+                System.err.println("❌ Error processing message: " + e.getMessage());
             }
         };
         
-        // Start consuming messages
-        // Parameters: queue name, auto-ack, deliver callback, cancel callback
-        // auto-ack = true means messages are automatically acknowledged
-        channel.basicConsume(QUEUE_NAME, true, deliverCallback, consumerTag -> {});
+        // Start consuming (auto-ack = true)
+        // With auto-ack: messages deleted automatically
+        channel.basicConsume(queueName, true, deliverCallback, consumerTag -> {});
         
-        System.out.println("⏳ Press CTRL+C to exit");
+        System.out.println("⏳ Press CTRL+C to stop consuming\n");
+        
+        // Keep running
+        Thread.currentThread().join();
     }
-    
+
     /**
-     * Simulates order processing (e.g., preparing food)
+     * Advanced: consume with manual acknowledgment (more reliable)
+     * Ensures message not lost if consumer crashes
      */
-    private static void processOrder(String order) throws InterruptedException {
-        System.out.println("🔄 Processing order...");
-        Thread.sleep(2000);  // Simulate 2 seconds of work
+    public void consumeMessagesManualAck() throws Exception {
+        String queueName = "user_" + userId + "_messages";
+        
+        channel.queueDeclare(queueName, true, false, false, null);
+        channel.basicQos(1);  // Process 1 message at a time
+        
+        System.out.println("🔔 Consumer for user '" + userId + "' (MANUAL ACK mode)\n");
+        
+        DeliverCallback deliverCallback = (consumerTag, delivery) -> {
+            String messageJson = new String(delivery.getBody());
+            
+            try {
+                UserMessage msg = UserMessage.fromJson(messageJson);
+                System.out.println("📥 [" + userId + "] Received: " + msg);
+                
+                // Process message
+                Thread.sleep(1000);
+                System.out.println("   ✓ Processed\n");
+                
+                // Manual ACK: tell broker we successfully processed this message
+                channel.basicAck(delivery.getEnvelope().getDeliveryTag(), false);
+                
+            } catch (Exception e) {
+                System.err.println("❌ Error: " + e.getMessage());
+                
+                // Negative ACK: requeue the message to try again
+                try {
+                    channel.basicNack(delivery.getEnvelope().getDeliveryTag(), false, true);
+                    System.out.println("   🔄 Requeued for retry\n");
+                } catch (Exception ex) {
+                    System.err.println("Error requeuing: " + ex.getMessage());
+                }
+            }
+        };
+        
+        // Start consuming (auto-ack = false → manual ACK required)
+        channel.basicConsume(queueName, false, deliverCallback, consumerTag -> {});
+        
+        System.out.println("⏳ Press CTRL+C to stop\n");
+        Thread.currentThread().join();
+    }
+
+    public void close() throws Exception {
+        if (channel != null && channel.isOpen()) {
+            channel.close();
+        }
+        if (connection != null && connection.isOpen()) {
+            connection.close();
+        }
+    }
+
+    public static void main(String[] args) {
+        if (args.length == 0) {
+            System.out.println("Usage: java Consumer <userId> [--manual-ack]");
+            System.out.println("Example: java Consumer bob");
+            System.out.println("Example: java Consumer bob --manual-ack");
+            System.exit(1);
+        }
+        
+        String userId = args[0];
+        boolean manualAck = args.length > 1 && args[1].equals("--manual-ack");
+        
+        Consumer consumer = null;
+        try {
+            consumer = new Consumer(userId);
+            
+            if (manualAck) {
+                consumer.consumeMessagesManualAck();
+            } else {
+                consumer.consumeMessagesAutoAck();
+            }
+            
+        } catch (Exception e) {
+            System.err.println("❌ Error in Consumer: " + e.getMessage());
+            e.printStackTrace();
+        } finally {
+            try {
+                if (consumer != null) {
+                    consumer.close();
+                }
+            } catch (Exception e) {
+                System.err.println("Error closing consumer: " + e.getMessage());
+            }
+        }
     }
 }
